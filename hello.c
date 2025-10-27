@@ -7,7 +7,9 @@
 #define UNUSED(x) (void)(x)
 
 // Enable verbose ASN.1 debug prints by defining ASN1_DEBUG (e.g. via compiler flag -DASN1_DEBUG)
+#ifndef ASN1_DEBUG
 #define ASN1_DEBUG
+#endif
 #ifdef ASN1_DEBUG
 #define DBG(fmt, ...) printf("[ASN1][depth=%u][off=%td] " fmt, parsing_context.nest_idx, (ptrdiff_t)(parsing_context.tag_ptr - parsing_context.buff), ##__VA_ARGS__)
 #else
@@ -46,9 +48,48 @@ UNIVERSAL 36            Relative OID internationalized resource identifier type
 UNIVERSAL 37-...        Reserved for addenda to this Recommendation | International Standard
 */
 
+
+
+typedef enum {
+    ASN1_RESERVED      = 0x00,
+    ASN1_BOOLEAN       = 0x01,
+    ASN1_INTEGER       = 0x02,
+    ASN1_BIT_STRING    = 0x03,
+    ASN1_OCTET_STRING  = 0x04,
+    ASN1_NULL          = 0x05,
+    ASN1_OBJECT_ID     = 0x06,
+    ASN1_SEQUENCE      = 0x30, // constructed
+    ASN1_SET           = 0x31, // constructed
+
+    ASN1_LEAVE_CONTAINER = 0xFF
+
+} asn1_tag_t;
+
+typedef enum {
+    OID_RESERVED,       // l'id 0 non voglio che sia valido
+    OID_AES_256_CBC,    // 2.16.840.1.101.3.4.1.42
+    OID_AES_256_WRAP,   // 2.16.840.1.101.3.4.1.45
+    OID_ENVELOPED_DATA, // 1.2.840.113549.1.7.3
+    OID_SIGNED_DATA,    // 1.2.840.113549.1.7.2
+    OID_DATA            // 1.2.840.113549.1.7.1
+} asn1_oid_t;
+
+// Forward declaration
+struct parsing_context_s;
+
+typedef struct{
+    asn1_tag_t tag;
+    void (*pre_parse_function)(void);
+    int  (*parse_function)(struct parsing_context_s*, void *);
+    void  *pDst;
+    void (*post_parse_function)(void);
+} asn1_parsing_table_t;
+
 struct parsing_context_s{
-    uint8_t *buff;
-    uint8_t buff_len;
+    asn1_parsing_table_t *parsing_table;
+
+    const uint8_t *buff;
+    size_t buff_len;
 
     uint8_t *tag_ptr;        // current tag pointer
     size_t len;              // length of current field data
@@ -65,24 +106,10 @@ struct bitstring_s {
     uint8_t data[256];
 };
 
-typedef enum {
-    ASN1_RESERVED      = 0x00,
-    ASN1_BOOLEAN       = 0x01,
-    ASN1_INTEGER       = 0x02,
-    ASN1_BIT_STRING    = 0x03,
-    ASN1_OCTET_STRING  = 0x04,
-    ASN1_NULL          = 0x05,
-    ASN1_OBJECT_ID     = 0x06,
-    ASN1_SEQUENCE      = 0x30, // constructed
-    ASN1_SET           = 0x31  // constructed
-
-} asn1_tag_t;
-
-typedef enum {
-    OID_RESERVED,
-    OID_AES_256_CBC,    // 2.16.840.1.101.3.4.1.42
-    OID_AES_256_WRAP    // 2.16.840.1.101.3.4.1.45
-} asn1_oid_t;
+struct octetstring_s {
+    size_t len;
+    uint8_t data[256];
+};
 
 typedef struct asn1_oid_map_s {
     asn1_oid_t oid_enum;
@@ -91,9 +118,12 @@ typedef struct asn1_oid_map_s {
 } asn1_oid_map_t;
 
 asn1_oid_map_t asn1_oid_map[] = {
-    { OID_AES_256_CBC,  9, { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2A } },
-    { OID_AES_256_WRAP, 9, { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2D } },
-    { 0, 0, { 0 } } // End marker
+    { OID_AES_256_CBC,      9, { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2A } },
+    { OID_AES_256_WRAP,     9, { 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2D } },
+    { OID_ENVELOPED_DATA,   9, { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x03 } },
+    { OID_SIGNED_DATA,      9, { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02 } },
+    { OID_DATA,             9, { 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x01 } },
+    { 0,                    0, { 0 } } // End marker
 };
 
 #define MAX_BYTE_LEN 4 // 4byte 32bit
@@ -222,7 +252,7 @@ int get_integer_from_asn1(struct parsing_context_s* this, void *pDst)
  * 
  * @return 0 on success, negative error code on failure.
  */
-int get_sequence(struct parsing_context_s* this, void* pDst) 
+int get_sequence_set(struct parsing_context_s* this, void* pDst) 
 {
     UNUSED(pDst);
     
@@ -231,9 +261,9 @@ int get_sequence(struct parsing_context_s* this, void* pDst)
         return -22; // Invalid input
     }
 
-    if (*this->tag_ptr != 0x30) 
+    if (*this->tag_ptr != ASN1_SEQUENCE && *this->tag_ptr != ASN1_SET) 
     {
-        return -1; // Not a SEQUENCE
+        return -1; // Not a SEQUENCE or SET
     }
 
     this->data_ptr = get_asn1_len(this->tag_ptr + 1, &this->len);
@@ -247,29 +277,8 @@ int get_sequence(struct parsing_context_s* this, void* pDst)
     } else {
         return -1; // nesting too deep
     }
-    DBG("ENTER SEQUENCE content_len=%zu content_end_off=%td\n", this->len, (ptrdiff_t)((this->data_ptr + this->len) - this->buff));
+    DBG("ENTER %s content_len=%zu content_end_off=%td\n", (this->tag_ptr[0] == ASN1_SEQUENCE) ? "SEQUENCE" : "SET", this->len, (ptrdiff_t)((this->data_ptr + this->len) - this->buff));
     return 0;
-}
-
-uint8_t *get_bitstring(const uint8_t *data, size_t *length) 
-{
-    if (data == NULL || length == NULL) 
-    {
-        return NULL; // Invalid input
-    }
-
-    if (data[0] != ASN1_BIT_STRING) 
-    {
-        return NULL; // Not a BIT STRING
-    }
-
-    unsigned char *next = get_asn1_len(data + 1, length);
-    if (next == NULL) 
-    {
-        return NULL; // Invalid length
-    }
-
-    return next;
 }
 
 /**
@@ -280,7 +289,7 @@ uint8_t *get_bitstring(const uint8_t *data, size_t *length)
  * 
  * @return 0 on success, negative error code on failure.
  */
-int get_bitstring_2(struct parsing_context_s* this, void* pDst) 
+int get_bitstring(struct parsing_context_s* this, void* pDst) 
 {
     if (this == NULL || pDst == NULL) 
     {
@@ -292,7 +301,7 @@ int get_bitstring_2(struct parsing_context_s* this, void* pDst)
         return -1; // Not a BIT STRING
     }
 
-    this->data_ptr = get_bitstring(this->tag_ptr, &this->len);
+    this->data_ptr = get_asn1_len(this->tag_ptr + 1, &this->len);//get_bitstring(this->tag_ptr, &this->len);
     if (this->data_ptr == NULL) 
     {
         return -1; // Invalid length
@@ -309,6 +318,32 @@ int get_bitstring_2(struct parsing_context_s* this, void* pDst)
         memcpy(bs->data, this->data_ptr + 1, this->len - 1);
     }
     DBG("BIT STRING unused_bits=%u bytes=%zu\n", bs->unused_bits, bs->len);
+    return 0;
+}
+
+int get_octetstring(struct parsing_context_s* this, void* pDst) 
+{
+    if (this == NULL || pDst == NULL) 
+    {
+        return -22; // Invalid input
+    }
+
+    if (this->tag_ptr[0] != ASN1_OCTET_STRING) 
+    {
+        return -1; // Not a OCTET STRING
+    }
+
+    this->data_ptr = get_asn1_len(this->tag_ptr + 1, &this->len);
+    if (this->data_ptr == NULL) 
+    {
+        return -1; // Invalid length
+    }
+
+    struct octetstring_s *os = (struct octetstring_s *)pDst;
+    os->len = this->len;
+    memcpy(os->data, this->data_ptr, this->len);
+
+    DBG("OCTET STRING len=%zu\n", this->len);
     return 0;
 }
 
@@ -357,7 +392,8 @@ struct parsed_data_l2_s
     bool b1;
     bool b2;
     int i1;
-    struct bitstring_s bs1;
+    //struct bitstring_s bs1;
+    struct octetstring_s os1;
 };
 
 struct parsed_data_l1_s {
@@ -366,69 +402,175 @@ struct parsed_data_l1_s {
     int i1;
     asn1_oid_t oid1;
     struct parsed_data_l2_s inner_data;
+    int i2;
 }parsed_data;
 
-typedef struct{
-    asn1_tag_t tag;
-    void (*pre_parse_function)(void);
-    int  (*parse_function)(struct parsing_context_s*, void *);
-    void  *pDst;
-    void (*post_parse_function)(void);
-} asn1_parsing_table_t;
-
 asn1_parsing_table_t parsing_table[] = {
-    { ASN1_SEQUENCE,    NULL, get_sequence,             NULL,                           NULL},
-    { ASN1_BOOLEAN,     NULL, get_boolean_from_asn1,    &parsed_data.b1,                NULL},
-    { ASN1_BOOLEAN,     NULL, get_boolean_from_asn1,    &parsed_data.b2,                NULL},
-    { ASN1_INTEGER,     NULL, get_integer_from_asn1,    &parsed_data.i1,                NULL},
-    { ASN1_OBJECT_ID,   NULL, get_oid_from_asn1,        &parsed_data.oid1,              NULL},
-    { ASN1_SEQUENCE,    NULL, get_sequence,             NULL,                           NULL},
-    { ASN1_OBJECT_ID,   NULL, get_oid_from_asn1,        &parsed_data.inner_data.oid1,   NULL},
-    { ASN1_BOOLEAN,     NULL, get_boolean_from_asn1,    &parsed_data.inner_data.b1,     NULL},
-    { ASN1_BOOLEAN,     NULL, get_boolean_from_asn1,    &parsed_data.inner_data.b2,     NULL},
-    { ASN1_INTEGER,     NULL, get_integer_from_asn1,    &parsed_data.inner_data.i1,     NULL},
-    { ASN1_BIT_STRING,  NULL, get_bitstring_2,          &parsed_data.inner_data.bs1,    NULL},
+    { ASN1_SEQUENCE,    NULL, get_sequence_set,             NULL,                           NULL},
+        { ASN1_BOOLEAN,     NULL, get_boolean_from_asn1,    &parsed_data.b1,                NULL},
+        { ASN1_BOOLEAN,     NULL, get_boolean_from_asn1,    &parsed_data.b2,                NULL},
+        { ASN1_INTEGER,     NULL, get_integer_from_asn1,    &parsed_data.i1,                NULL},
+        { ASN1_OBJECT_ID,   NULL, get_oid_from_asn1,        &parsed_data.oid1,              NULL},
+        { ASN1_SEQUENCE,    NULL, get_sequence_set,             NULL,                           NULL},
+            { ASN1_OBJECT_ID,       NULL, get_oid_from_asn1,        &parsed_data.inner_data.oid1,   NULL},
+            { ASN1_BOOLEAN,         NULL, get_boolean_from_asn1,    &parsed_data.inner_data.b1,     NULL},
+            { ASN1_BOOLEAN,         NULL, get_boolean_from_asn1,    &parsed_data.inner_data.b2,     NULL},
+            { ASN1_INTEGER,         NULL, get_integer_from_asn1,    &parsed_data.inner_data.i1,     NULL},
+            { ASN1_OCTET_STRING,      NULL, get_octetstring,          &parsed_data.inner_data.os1,    NULL},
+            { ASN1_LEAVE_CONTAINER, NULL, NULL,                     NULL,                           NULL},
+        { ASN1_INTEGER,     NULL, get_integer_from_asn1,    &parsed_data.i2,                NULL},
+        { ASN1_LEAVE_CONTAINER, NULL, NULL,                 NULL,                           NULL},
     { ASN1_RESERVED,    NULL, NULL,                     NULL,                           NULL}
 };
 
+struct PKCS_CMS_s
+{
+    asn1_oid_t              oid_content_type;
+    int                     CMS_version;
+    int                     KEK_recipient_info_version;
+    struct octetstring_s    key_id;
+    asn1_oid_t              oid_KEK_algorythm;
+    struct octetstring_s    wrapped_key;
+    asn1_oid_t              oid_enc_content_info;
+    asn1_oid_t              oid_enc_algorythm;
+    struct octetstring_s    aes_IV;
+    struct octetstring_s    enc_key;
+}; 
+
+struct PKCS_CMS_s pkcs7_cms = {0};
+
+
+
+/*
+┌───────────────────────────────────────────────────────────┐
+│ CMS ContentInfo (application/pkcs7-mime)                  │
+│ ├─ contentType: id-envelopedData                          │
+│ └─ content: EnvelopedData                                 │
+│    ├─ version: 4                                          │
+│    │                                                      │
+│    ├─ recipientInfos: SET OF                              │
+│    │  └─ KEKRecipientInfo                                 │
+│    │     ├─ version: 4                                    │
+│    │     ├─ kekid:                                        │
+│    │     │  └─ keyIdentifier: "aes-key-123"               │
+│    │     ├─ keyEncryptionAlgorithm:                       │
+│    │     │  └─ algorithm: AES-256-WRAP (no params)        │ ← WRAP non ha IV!
+│    │     └─ encryptedKey: [40 bytes]                      │ ← Wrapped CEK
+│    │                                                      │
+│    └─ encryptedContentInfo:                               │
+│       ├─ contentType: id-signedData                       │
+│       ├─ contentEncryptionAlgorithm:                      │
+│       │  ├─ algorithm: AES-256-CBC                        │
+│       │  └─ parameters: IV [16 bytes]                     │
+│       └─ encryptedContent: [key bytes]                    │
+└───────────────────────────────────────────────────────────┘
+*/
+asn1_parsing_table_t pkcs7_CMS_enveloped_parsing_table[] = 
+{
+    { ASN1_SEQUENCE,    NULL, get_sequence_set,             NULL,                           NULL},
+        { ASN1_OBJECT_ID,   NULL, get_oid_from_asn1,        &pkcs7_cms.oid_content_type,     NULL},
+        { ASN1_SEQUENCE,    NULL, get_sequence_set,             NULL,                       NULL},
+            { ASN1_SEQUENCE,    NULL, get_sequence_set,             NULL,                       NULL},
+                { ASN1_INTEGER,     NULL, get_integer_from_asn1,    &pkcs7_cms.CMS_version,                NULL},
+
+                { ASN1_SET,    NULL, get_sequence_set,             NULL,                       NULL},
+                    { ASN1_SEQUENCE,    NULL, get_sequence_set,             NULL,                       NULL},
+                        { ASN1_INTEGER,     NULL, get_integer_from_asn1,    &pkcs7_cms.KEK_recipient_info_version,                NULL},
+                        { ASN1_SEQUENCE,    NULL, get_sequence_set,             NULL,                       NULL},
+                            { ASN1_OCTET_STRING,      NULL, get_octetstring,          &pkcs7_cms.key_id,    NULL},
+                            { ASN1_LEAVE_CONTAINER, NULL, NULL,                     NULL,                           NULL},
+                        { ASN1_SEQUENCE,    NULL, get_sequence_set,             NULL,                       NULL},
+                            { ASN1_OBJECT_ID,   NULL, get_oid_from_asn1,        &pkcs7_cms.oid_KEK_algorythm,     NULL},
+                            { ASN1_LEAVE_CONTAINER, NULL, NULL,                     NULL,                           NULL},
+                        { ASN1_OCTET_STRING,      NULL, get_octetstring,          &pkcs7_cms.wrapped_key,    NULL},
+                        { ASN1_LEAVE_CONTAINER, NULL, NULL,                     NULL,                           NULL},
+                    { ASN1_LEAVE_CONTAINER, NULL, NULL,                     NULL,                           NULL},
+
+                { ASN1_SEQUENCE,    NULL, get_sequence_set,             NULL,                       NULL},
+                    { ASN1_OBJECT_ID,   NULL, get_oid_from_asn1,        &pkcs7_cms.oid_enc_content_info,     NULL},
+                    { ASN1_SEQUENCE,    NULL, get_sequence_set,             NULL,                       NULL},
+                        { ASN1_OBJECT_ID,   NULL, get_oid_from_asn1,        &pkcs7_cms.oid_enc_algorythm,     NULL},
+                        { ASN1_OCTET_STRING,      NULL, get_octetstring,          &pkcs7_cms.aes_IV,    NULL},
+                        { ASN1_LEAVE_CONTAINER, NULL, NULL,                     NULL,                           NULL},
+                    { ASN1_OCTET_STRING,      NULL, get_octetstring,          &pkcs7_cms.enc_key,    NULL},                        
+                    { ASN1_LEAVE_CONTAINER, NULL, NULL,                     NULL,                           NULL},
+                        
+                { ASN1_LEAVE_CONTAINER, NULL, NULL,                     NULL,                           NULL},
+                        
+            { ASN1_LEAVE_CONTAINER, NULL, NULL,                     NULL,                           NULL},
+        { ASN1_LEAVE_CONTAINER, NULL, NULL,                     NULL,                           NULL},
+    { ASN1_RESERVED,    NULL, NULL,                     NULL,                           NULL}
+};
+
+uint8_t asn1_data[] = { 0x30, 0x29, 
+                            0x01, 0x01, 0x00,
+                            0x01, 0x01, 0xFF, 
+                            0x02, 0x01, 0x42, 
+                            0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2A,
+                            0x30, 0x19,
+                                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2D, 
+                                0x01, 0x01, 0xFF, 
+                                0x01, 0x01, 0x00, 
+                                0x02, 0x01, 0x55,
+                                0x04, 0x05, 0x02, 0xBB, 0xCC, 0xDD, 0xFC,
+                            0x02, 0x01, 0x11, 
+                    }; // SEQUENCE { 
+                        //           BOOLEAN FALSE, 
+                        //           BOOLEAN TRUE, 
+                        //           INTEGER 0x42, 
+                        //           OBJECT IDENTIFIER 2.16.840.1.101.3.4.1.42
+                        //           SEQUENCE { 
+                        //                   OBJECT IDENTIFIER 2.16.840.1.101.3.4.1.45
+                        //                   BOOLEAN FALSE, 
+                        //                   BOOLEAN TRUE, 
+                        //                   INTEGER 0x55, 
+                        //                   BITSTRING { 0x02 0xBB 0xCC 0xDD 0xFC } 
+                        //           INTEGER 0x11
+                        //           } 
+                        // }
+
+uint8_t pkcs7_raw[]=
+{
+    0x30, 0x82, 0x01, 0x13, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x03, 0x30,
+    0x82, 0x01, 0x04, 0x30, 0x82, 0x01, 0x00, 0x02, 0x01, 0x04, 0x31, 0x4B, 0x30, 0x49, 0x02, 0x01,
+    0x04, 0x30, 0x0D, 0x04, 0x0B, 0x61, 0x65, 0x73, 0x2D, 0x6B, 0x65, 0x79, 0x2D, 0x30, 0x30, 0x31,
+    0x30, 0x0B, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2D, 0x04, 0x28, 0xB6,
+    0xB9, 0xF4, 0x1A, 0xA4, 0x32, 0xF3, 0x04, 0x96, 0xB8, 0x87, 0xFC, 0x63, 0x3B, 0xE3, 0xA6, 0x1C,
+    0xF0, 0xCD, 0xA7, 0xAE, 0xBB, 0x04, 0x9C, 0x9D, 0x1C, 0x2C, 0x4E, 0xA7, 0xCC, 0x73, 0x8B, 0xD9,
+    0xBE, 0x8B, 0x70, 0xD1, 0xE2, 0xF7, 0x3A, 0x30, 0x81, 0xAD, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86,
+    0xF7, 0x0D, 0x01, 0x07, 0x01, 0x30, 0x1D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
+    0x01, 0x2A, 0x04, 0x10, 0x0E, 0x3F, 0x3E, 0x7F, 0x40, 0xF4, 0xFA, 0xD1, 0x67, 0x09, 0x7F, 0xF1,
+    0x8B, 0x09, 0xFB, 0x3F, 0x04, 0x81, 0x80, 0xED, 0x4A, 0xF0, 0x96, 0x34, 0x5C, 0x11, 0x86, 0x4B,
+    0x0F, 0x7C, 0x42, 0x97, 0xFB, 0x47, 0x72, 0x11, 0x70, 0xC6, 0x5D, 0x17, 0x5E, 0x4E, 0x04, 0xD9,
+    0x4F, 0x00, 0xA0, 0xFB, 0xCC, 0x66, 0xFA, 0xBB, 0x97, 0x60, 0x4C, 0xF7, 0xB2, 0xC5, 0x67, 0x20,
+    0x14, 0x5D, 0xF9, 0xE8, 0x73, 0xCB, 0xE3, 0xB7, 0x00, 0xA4, 0x14, 0x64, 0xB7, 0x8D, 0x6C, 0x2B,
+    0x28, 0x60, 0x2B, 0x24, 0x05, 0xEF, 0xBE, 0xD5, 0x72, 0x78, 0x34, 0x18, 0xA9, 0x48, 0x04, 0x75,
+    0xD6, 0x2A, 0x70, 0xFD, 0xFF, 0x27, 0x8E, 0x14, 0x0B, 0xAE, 0x9F, 0x5F, 0x94, 0xD7, 0x14, 0xAD,
+    0x5D, 0x0D, 0x47, 0x67, 0x36, 0xD0, 0xD2, 0xC9, 0x75, 0x23, 0xA5, 0x69, 0xB9, 0xE2, 0x97, 0xE0,
+    0xB5, 0xC1, 0x69, 0x5A, 0x66, 0x87, 0x09, 0xCF, 0x7D, 0x6C, 0x18, 0x3D, 0xCD, 0x3C, 0x3A, 0x13,
+    0x27, 0xFE, 0x59, 0xF4, 0x5D, 0x1B, 0x54
+};
+
+
+struct parsing_context_s init_asn1_parser(asn1_parsing_table_t *parsing_table, const uint8_t *pSrc, size_t buff_len)
+{
+    struct parsing_context_s context = { 0 };
+    
+    context.parsing_table = parsing_table;
+    context.buff = pSrc;
+    context.buff_len = buff_len;
+    context.tag_ptr = (uint8_t *)context.buff; // Cast away const for parsing navigation
+    context.len = 0;
+    context.data_ptr = NULL;
+
+    return context;
+}
 
 int main() 
-{
-    uint8_t asn1_data[] = { 0x30, 0x26, 
-                                0x01, 0x01, 0x00,
-                                0x01, 0x01, 0xFF, 
-                                0x02, 0x01, 0x42, 
-                                0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2A,
-                                0x30, 0x19,
-                                    0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2D, 
-                                    0x01, 0x01, 0xFF, 
-                                    0x01, 0x01, 0x00, 
-                                    0x02, 0x01, 0x55,
-                                    0x03, 0x05, 0x02, 0xBB, 0xCC, 0xDD, 0xFC
-                        }; // SEQUENCE { 
-                           //           BOOLEAN FALSE, 
-                           //           BOOLEAN TRUE, 
-                           //           INTEGER 0x42, 
-                           //           OBJECT IDENTIFIER 2.16.840.1.101.3.4.1.42
-                           //           SEQUENCE { 
-                           //                   OBJECT IDENTIFIER 2.16.840.1.101.3.4.1.45
-                           //                   BOOLEAN FALSE, 
-                           //                   BOOLEAN TRUE, 
-                           //                   INTEGER 0x55, 
-                           //                   BITSTRING { 0x02 0xBB 0xCC 0xDD 0xFC } 
-                           //           } 
-                           // }
-                           
-    uint8_t buff_len = sizeof(asn1_data);
-    UNUSED(buff_len);
+{    
+    parsing_context = init_asn1_parser(pkcs7_CMS_enveloped_parsing_table, pkcs7_raw, sizeof(pkcs7_raw));
 
-    parsing_context.buff = asn1_data;
-    parsing_context.buff_len = sizeof(asn1_data);
-    parsing_context.tag_ptr = asn1_data;
-    parsing_context.len = 0;
-    parsing_context.data_ptr = NULL;
-
-    for (asn1_parsing_table_t *entry = parsing_table; entry->tag != 0; entry++) 
+    for (asn1_parsing_table_t *entry = parsing_context.parsing_table; entry->tag != 0; entry++) 
     {
         if(entry->pre_parse_function != NULL) 
         {
@@ -466,26 +608,32 @@ int main()
         }
     }
 
-    // Print parsed data
-    printf("Parsed Data:\n");
-    printf("Outer BOOLEAN 1: %s\n", parsed_data.b1 ? "TRUE" : "FALSE");
-    printf("Outer BOOLEAN 2: %s\n", parsed_data.b2 ? "TRUE" : "FALSE");
-    printf("Outer INTEGER 1: %d\n", parsed_data.i1);
-    printf("Outer OID 1: %d (%s)\n", parsed_data.oid1,
-           (parsed_data.oid1 == OID_AES_256_CBC) ? "AES-256-CBC" :
-           (parsed_data.oid1 == OID_AES_256_WRAP) ? "AES-256-WRAP" : "Unknown");
-    printf("\tInner OID 1: %d (%s)\n", parsed_data.inner_data.oid1,
-           (parsed_data.inner_data.oid1 == OID_AES_256_CBC) ? "AES-256-CBC" :
-           (parsed_data.inner_data.oid1 == OID_AES_256_WRAP) ? "AES-256-WRAP" : "Unknown");
-    printf("\tInner BOOLEAN 1: %s\n", parsed_data.inner_data.b1 ? "TRUE" : "FALSE");
-    printf("\tInner BOOLEAN 2: %s\n", parsed_data.inner_data.b2 ? "TRUE" : "FALSE");
-    printf("\tInner INTEGER 1: %d\n", parsed_data.inner_data.i1);
-    printf("\tInner BIT STRING 1: (%d) ", parsed_data.inner_data.bs1.unused_bits);
-    for (size_t i = 0; i < parsed_data.inner_data.bs1.len; i++) 
-    {
-        printf("%02X ", parsed_data.inner_data.bs1.data[i]);
-    }
-    printf("\n");
+    // // Print parsed data
+    // printf("Parsed Data:\n");
+    // printf("Outer BOOLEAN 1: %s\n", parsed_data.b1 ? "TRUE" : "FALSE");
+    // printf("Outer BOOLEAN 2: %s\n", parsed_data.b2 ? "TRUE" : "FALSE");
+    // printf("Outer INTEGER 1: %d\n", parsed_data.i1);
+    // printf("Outer OID 1: %d (%s)\n", parsed_data.oid1,
+    //        (parsed_data.oid1 == OID_AES_256_CBC) ? "AES-256-CBC" :
+    //        (parsed_data.oid1 == OID_AES_256_WRAP) ? "AES-256-WRAP" : "Unknown");
+    // printf("\tInner OID 1: %d (%s)\n", parsed_data.inner_data.oid1,
+    //        (parsed_data.inner_data.oid1 == OID_AES_256_CBC) ? "AES-256-CBC" :
+    //        (parsed_data.inner_data.oid1 == OID_AES_256_WRAP) ? "AES-256-WRAP" : "Unknown");
+    // printf("\tInner BOOLEAN 1: %s\n", parsed_data.inner_data.b1 ? "TRUE" : "FALSE");
+    // printf("\tInner BOOLEAN 2: %s\n", parsed_data.inner_data.b2 ? "TRUE" : "FALSE");
+    // printf("\tInner INTEGER 1: %d\n", parsed_data.inner_data.i1);
+    // // printf("\tInner BIT STRING 1: (%d) ", parsed_data.inner_data.bs1.unused_bits);
+    // // for (size_t i = 0; i < parsed_data.inner_data.bs1.len; i++) 
+    // // {
+    // //     printf("%02X ", parsed_data.inner_data.bs1.data[i]);
+    // // }
+    // printf("\tInner OCTET STRING 1: ");
+    // for (size_t i = 0; i < parsed_data.inner_data.os1.len; i++) 
+    // {
+    //     printf("%02X ", parsed_data.inner_data.os1.data[i]);
+    // }
+    // printf("\n");
+    // printf("Outer INTEGER 2: %d\n", parsed_data.i2);
 
     return 0;
 }
