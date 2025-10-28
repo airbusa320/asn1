@@ -91,9 +91,9 @@ struct parsing_context_s{
     const uint8_t *buff;
     size_t buff_len;
 
-    uint8_t *tag_ptr;        // current tag pointer
+    const uint8_t *tag_ptr;  // current tag pointer
     size_t len;              // length of current field data
-    uint8_t *data_ptr;       // pointer to current field data (after length bytes)
+    const uint8_t *data_ptr; // pointer to current field data (after length bytes)
 
     uint8_t nest_idx;        // current nesting depth (number of open SEQUENCE/SET containers)
     uint8_t *container_end[MAX_NESTING_DEPTH]; // stack of end pointers for open containers (content end addresses)
@@ -774,8 +774,299 @@ int asn_parser(struct parsing_context_s *parsing_context){
     return 0;
 }
 
+#define HTTP_RESPONSE_FILENAME "response_body.txt"
+#define BOUNDARY_STRING_START "--EST-"
+#define SERVERKEYGEN_STRING "server-generated-key"
+#define SERVERKEYGEN_STRING_LEN 20
+#define CERTSONLY_STRING "certs-only"
+#define CERTSONLY_STRING_LEN 10
+
+#define LINE_TERMINATOR "\r\n"
+
+/**
+ * Search for a specific string in a file. And set the file position to the byte after the found string.
+ */
+int find_string_in_file(FILE *file, const char *search_string, size_t search_string_len, uint8_t *tempBuffer, size_t tempBufferLen)
+{
+    if(!file || !search_string || search_string_len == 0 || !tempBuffer || tempBufferLen == 0 || search_string_len > tempBufferLen)
+    {
+        return -1;
+    }
+
+    int c;
+    size_t fileStartSearchPos = ftell(file);
+    size_t filePos;
+    
+    uint8_t firstChar = search_string[0];
+    while ((c = fgetc(file)) != EOF)
+    {
+        if (c == firstChar) 
+        {
+            // Potential match found, read ahead
+            tempBuffer[0] = (uint8_t)c;
+            filePos = ftell(file);
+            fread(tempBuffer + 1, 1, search_string_len - 1, file);
+
+            if (memcmp(tempBuffer, search_string, search_string_len) == 0) 
+            {
+                // Match found
+                return 0;
+            } 
+            else 
+            {
+                // No match, reset file position
+                fseek(file, filePos, SEEK_SET);
+            }
+        } 
+    }
+    fseek(file, fileStartSearchPos, SEEK_SET);
+    return -1;
+}
+
+#define MAX(A, B) ((A) > (B) ? (A) : (B))
+
+int find_string_in_line(FILE *file, const char *search_string, size_t search_string_len, uint8_t *tempBuffer, size_t tempBufferLen)
+{
+    if(!file || !search_string || search_string_len == 0 || !tempBuffer || tempBufferLen == 0 || search_string_len > tempBufferLen)
+    {
+        return -1;
+    }
+    int ret = 0;
+    int c = 0;
+    size_t filePosStartSearch = ftell(file);
+    size_t filePosEndLine = 0;
+    size_t filePos;
+
+    ret = find_string_in_file(file, LINE_TERMINATOR, strlen(LINE_TERMINATOR), tempBuffer, tempBufferLen);
+    if (ret != 0)
+    {
+        return -1; // Line terminator not found
+    }
+    filePosEndLine = ftell(file) - strlen(LINE_TERMINATOR);
+    // Reset to start of line
+    fseek(file, filePosStartSearch, SEEK_SET);
+    size_t lineLen = filePosEndLine - filePosStartSearch;
+
+    uint8_t firstChar = search_string[0];
+    while (lineLen > search_string_len)
+    {
+        c = fgetc(file);
+        lineLen--;
+
+        if (c == firstChar) 
+        {
+            // Potential match found, read ahead
+            tempBuffer[0] = (uint8_t)c;
+            filePos = ftell(file);
+
+            ret = fread(tempBuffer + 1, 1, search_string_len - 1, file);
+            lineLen -= ret;
+            if (memcmp(tempBuffer, search_string, search_string_len) == 0) 
+            {
+                // Match found
+                return 0;
+            } 
+            else 
+            {
+                // No match, reset file position
+                fseek(file, filePos, SEEK_SET);
+            }
+        } 
+    }
+
+    fseek(file, filePosStartSearch, SEEK_SET);
+    return -1;
+
+}
+
+
+int check_empty_line(FILE *file)
+{
+    uint8_t buffer[3] = {0};
+    size_t bytesRead = fread(buffer, 1, 2, file);
+    if (bytesRead < 2) 
+    {
+        return -1; // Not enough data
+    }
+
+    if (buffer[0] == '\r' && buffer[1] == '\n') 
+    {
+        return 0; // Empty line
+    } 
+    else 
+    {
+        // Not an empty line, reset file position
+        fseek(file, -((long)bytesRead), SEEK_CUR);
+        return -2;
+    }
+}
+
+// int read_line(FILE *file, uint8_t *buffer, size_t max_len)
+// {
+//     // leggo il file fino a incontrare LINE_TERMINATOR o fino a max_len
+
+//     size_t bytesRead = 0;
+//     uint8_t c;
+
+//     while (bytesRead < max_len - 1) 
+//     {
+//         c = fgetc(file);
+//         if (c == EOF) 
+//         {
+//             buffer[bytesRead] = '\0';
+//             break;
+//         }
+
+//         buffer[bytesRead++] = c;
+
+//         // Check for line terminator
+//         if (bytesRead >= 2 && buffer[bytesRead - 2] == '\n' && buffer[bytesRead - 1] == '\r') 
+//         {
+//             buffer[bytesRead - 2] = '\0'; // Null-terminate the string, removing the line terminator
+//             break;
+//         }
+//     }
+//     return bytesRead;
+// }
+
+int search_base64_obj(FILE *file, uint8_t *workBuffer, char* search_string_obj, size_t workBufferLen)
+{
+        int ret = find_string_in_file(file, search_string_obj, strlen(search_string_obj), workBuffer, workBufferLen);
+    if (ret != 0) {
+        printf("Error: %s not found in file\n", search_string_obj);
+        return -1;
+    }
+    // Skip line terminator
+    find_string_in_file(file, LINE_TERMINATOR, strlen(LINE_TERMINATOR), workBuffer, workBufferLen);
+    // ora il file potrebbe contenere delle righe "Content..." o delle righe vuote prima del base64
+    do
+    {
+        // cerca nella riga
+        ret = find_string_in_line(file, "Content-", strlen("Content-"), workBuffer, workBufferLen);
+        // passa alla riga successiva
+        if(ret == 0)
+        {
+            find_string_in_file(file, LINE_TERMINATOR, strlen(LINE_TERMINATOR), workBuffer, workBufferLen);
+        }
+    } while (ret == 0);
+    //find_string_in_file(file, LINE_TERMINATOR, strlen(LINE_TERMINATOR), workBuffer, workBufferLen);
+
+
+    // se ci sono, salto tutte le righe vuote
+    while ((ret = check_empty_line(file)) == 0)
+    {
+        // continua a saltare righe vuote
+    }
+    if (ret == -1)
+    {
+        printf("Error reading file while skipping empty lines\n");
+        return -1;
+    }
+    return 0;
+}
+
+int read_decode64_save(FILE *fIn, FILE *fOut, uint8_t *workBuffer, size_t workBufferLen)
+{
+    size_t bytesRead = 0;
+    size_t writeLen = 0;
+    while (1)
+    {
+        bytesRead = fread(workBuffer, 1, workBufferLen, fIn);
+        if (bytesRead == 0)
+        {
+            break; // EOF
+        }
+
+        // Check for line terminator in buffer
+        writeLen = bytesRead;
+        for (size_t i = 0; i < bytesRead - 1u; i++)
+        {
+            if (workBuffer[i] == '\r' && workBuffer[i + 1] == '\n')
+            {
+                writeLen = i; // Stop before line terminator
+                break;
+            }
+            // TODO: handle base64 decoding here
+        }
+
+        fwrite(workBuffer, 1, writeLen, fOut);
+
+        if (writeLen < bytesRead)
+        {
+            break; // Found line terminator
+        }
+    }
+    return writeLen;
+}
+
 int main() 
-{    
+{
+    uint8_t buffer[1024];
+
+    // keygen
+    // read http dump
+    FILE *fBody = fopen(HTTP_RESPONSE_FILENAME, "rb");
+    if (fBody == NULL) {
+        printf("Error opening file: %s\n", HTTP_RESPONSE_FILENAME);
+        return -1;
+    }
+
+    int ret = search_base64_obj(fBody, buffer, SERVERKEYGEN_STRING, sizeof(buffer));
+    if (ret != 0)
+    {
+        fclose(fBody);
+        return -1;
+    }
+
+    // ora il file punta all'inizio del base64
+    // leggo e scrivo su out fino all'a capo
+    
+    FILE *out = fopen("serverkeygen_base64.txt", "wb");
+    if (out == NULL)
+    {
+        printf("Error opening output file: serverkeygen_base64.txt\n");
+        return -1;
+    }
+
+    read_decode64_save(fBody, out, buffer, sizeof(buffer));
+
+    fclose(out);
+    fclose(fBody);
+
+
+    //certonly
+    // read http dump
+    fBody = fopen(HTTP_RESPONSE_FILENAME, "rb");
+    if (fBody == NULL) {
+        printf("Error opening file: %s\n", HTTP_RESPONSE_FILENAME);
+        return -1;
+    }
+
+    ret = search_base64_obj(fBody, buffer, CERTSONLY_STRING, sizeof(buffer));
+    if (ret != 0)
+    {
+        fclose(fBody);
+        return -1;
+    }
+
+    // ora il file punta all'inizio del base64
+    // leggo e scrivo su out fino all'a capo
+    
+    out = fopen("certonly_base64.txt", "wb");
+    if (out == NULL)
+    {
+        printf("Error opening output file: certonly_base64.txt\n");
+        return -1;
+    }
+
+    read_decode64_save(fBody, out, buffer, sizeof(buffer));
+
+    fclose(out);
+    fclose(fBody);
+
+
+    return 0;
+//-----------------------------------------------
     struct parsing_context_s parsing_context_CMS = { 0 };
     struct parsing_context_s parsing_context_cert_only = { 0 };
     int retCode = 0;
